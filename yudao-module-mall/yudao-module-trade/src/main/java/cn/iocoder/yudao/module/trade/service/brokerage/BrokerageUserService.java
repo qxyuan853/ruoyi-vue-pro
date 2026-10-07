@@ -77,6 +77,15 @@ public interface BrokerageUserService {
     boolean updateUserPrice(Long id, Integer price);
 
     /**
+     * 更新用户佣金，扣减时要求可用佣金充足
+     *
+     * @param id    用户编号
+     * @param price 用户可用佣金的变动值（负数为扣减）
+     * @return 更新结果，false 表示可用佣金不足、未扣减
+     */
+    boolean updateUserPriceWhenEnough(Long id, Integer price);
+
+    /**
      * 更新用户冻结佣金
      *
      * @param id          用户编号

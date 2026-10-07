@@ -306,7 +306,9 @@ public class BrokerageRecordServiceImpl implements BrokerageRecordService {
         }
 
         // 2. 更新佣金余额
-        boolean success = brokerageUserService.updateUserPrice(userId, brokeragePrice);
+        // 注意：必须使用带 CAS 的 updateUserPriceWhenEnough。上面第 1 步的「校验佣金余额」是
+        // 先读后判断，两个并发请求会读到同一个余额、都通过校验，然后各自扣减一次，把余额扣成负数。
+        boolean success = brokerageUserService.updateUserPriceWhenEnough(userId, brokeragePrice);
         if (!success) {
             // 失败时，则抛出异常。只会出现扣减佣金时，余额不足的情况
             throw exception(BROKERAGE_WITHDRAW_USER_BALANCE_NOT_ENOUGH, MoneyUtils.fenToYuanStr(balance));

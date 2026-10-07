@@ -70,6 +70,26 @@ public interface BrokerageUserMapper extends BaseMapperX<BrokerageUserDO> {
     }
 
     /**
+     * 更新用户可用佣金（减少），仅在可用佣金充足时才更新
+     *
+     * 与 {@link #updatePriceDecr(Long, Integer)} 的区别：该方法带 CAS 条件，返回 0 表示
+     * 余额不足、未扣减。扣减佣金余额（例如提现）必须使用该方法，因为「余额是否充足」不能只靠
+     * 先读后判断：两个并发请求会读到同一个余额、都通过校验，然后各自扣减一次。
+     *
+     * @param id        用户编号
+     * @param incrCount 增加佣金（负数）
+     * @return 更新行数，0 表示可用佣金不足
+     */
+    default int updatePriceDecrWhenEnough(Long id, Integer incrCount) {
+        Assert.isTrue(incrCount < 0);
+        LambdaUpdateWrapper<BrokerageUserDO> lambdaUpdateWrapper = new LambdaUpdateWrapper<BrokerageUserDO>()
+                .setSql(" brokerage_price = brokerage_price + " + incrCount) // 负数，所以使用 + 号
+                .eq(BrokerageUserDO::getId, id)
+                .ge(BrokerageUserDO::getBrokeragePrice, -incrCount); // cas 逻辑
+        return update(null, lambdaUpdateWrapper);
+    }
+
+    /**
      * 更新用户冻结佣金（增加）
      *
      * @param id        用户编号
