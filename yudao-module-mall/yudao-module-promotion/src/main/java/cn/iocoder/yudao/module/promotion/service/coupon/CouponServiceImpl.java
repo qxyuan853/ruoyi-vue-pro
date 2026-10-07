@@ -20,6 +20,8 @@ import cn.iocoder.yudao.module.promotion.enums.coupon.CouponStatusEnum;
 import cn.iocoder.yudao.module.promotion.enums.coupon.CouponTakeTypeEnum;
 import cn.iocoder.yudao.module.promotion.enums.coupon.CouponTemplateValidityTypeEnum;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
@@ -28,6 +30,7 @@ import org.springframework.validation.annotation.Validated;
 import javax.annotation.Resource;
 import java.time.LocalDateTime;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static cn.iocoder.yudao.framework.common.exception.util.ServiceExceptionUtil.exception;
@@ -46,8 +49,20 @@ import static java.util.Arrays.asList;
 @Validated
 public class CouponServiceImpl implements CouponService {
 
+    /**
+     * 领取优惠劵的分布式锁
+     *
+     * KEY 格式：promotion_coupon_take:lock:{templateId}:{userId}
+     * VALUE 数据格式：HASH // RLock.class：Redisson 的 Lock 锁，使用 Hash 数据结构
+     */
+    private static final String COUPON_TAKE_LOCK = "promotion_coupon_take:lock:%d:%d";
+    private static final long COUPON_TAKE_LOCK_TIMEOUT_MILLIS = 30 * 1000L;
+
     @Resource
     private CouponTemplateService couponTemplateService;
+
+    @Resource
+    private RedissonClient redissonClient;
 
     @Resource
     private CouponMapper couponMapper;
@@ -119,8 +134,48 @@ public class CouponServiceImpl implements CouponService {
     }
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public Map<Long, List<Long>> takeCoupon(Long templateId, Set<Long> userIds, CouponTakeTypeEnum takeType) {
+        // 【安全】串行化同一 (模板, 用户) 的并发领取。
+        //
+        // takeCoupon() 内部先 SELECT promotion_coupon 数出该用户已领取的数量（removeTakeLimitUser），
+        // 再 INSERT 新券，两步之间没有行锁、CAS，promotion_coupon 上也没有 (template_id, user_id)
+        // 唯一索引，所以并发请求会全部读到同一个已领数量、全部通过 take_limit_count（每人限领个数）
+        // 校验、全部插入成功。总发放量 total_count 有条件更新兜底，但每人限领个数没有。
+        //
+        // 锁必须加在事务【外面】：如果在事务内加锁，先提交前就 unlock，后一个事务拿到锁后建立的
+        // 一致性读快照仍可能看不到前一个事务刚插入的记录，锁就白加了。
+        //
+        // 这里用 Redis 锁而不是 SELECT ... FOR UPDATE，因为 FOR UPDATE 在本项目支持的
+        // SQL Server 上是语法错误（SQL Server 用 WITH (UPDLOCK)），而 Redisson 是所有
+        // 部署都已经依赖的组件。
+        if (CollUtil.isEmpty(userIds)) {
+            return getSelf().takeCoupon0(templateId, userIds, takeType);
+        }
+        RLock lock = buildTakeLock(templateId, userIds);
+        lock.lock(COUPON_TAKE_LOCK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        try {
+            return getSelf().takeCoupon0(templateId, userIds, takeType);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 构建领取优惠劵的分布式锁。多个用户（后台指定发放）时使用联锁，并按用户编号排序，避免交叉加锁死锁
+     *
+     * @param templateId 优惠劵模板编号
+     * @param userIds    用户编号数组
+     * @return 锁
+     */
+    private RLock buildTakeLock(Long templateId, Set<Long> userIds) {
+        RLock[] locks = userIds.stream().sorted()
+                .map(userId -> redissonClient.getLock(String.format(COUPON_TAKE_LOCK, templateId, userId)))
+                .toArray(RLock[]::new);
+        return locks.length == 1 ? locks[0] : redissonClient.getMultiLock(locks);
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public Map<Long, List<Long>> takeCoupon0(Long templateId, Set<Long> userIds, CouponTakeTypeEnum takeType) {
         CouponTemplateDO template = couponTemplateService.getCouponTemplate(templateId);
         return takeCoupon(template, userIds, takeType);
     }

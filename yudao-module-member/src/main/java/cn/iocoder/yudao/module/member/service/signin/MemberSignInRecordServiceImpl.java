@@ -19,7 +19,10 @@ import cn.iocoder.yudao.module.member.enums.point.MemberPointBizTypeEnum;
 import cn.iocoder.yudao.module.member.service.level.MemberLevelService;
 import cn.iocoder.yudao.module.member.service.point.MemberPointRecordService;
 import cn.iocoder.yudao.module.member.service.user.MemberUserService;
+import cn.hutool.extra.spring.SpringUtil;
 import org.apache.commons.lang3.StringUtils;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.validation.annotation.Validated;
@@ -27,6 +30,7 @@ import org.springframework.validation.annotation.Validated;
 import javax.annotation.Resource;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import static cn.iocoder.yudao.framework.common.exception.util.ServiceExceptionUtil.exception;
 import static cn.iocoder.yudao.framework.common.util.collection.CollectionUtils.convertSet;
@@ -41,8 +45,20 @@ import static cn.iocoder.yudao.module.member.enums.ErrorCodeConstants.SIGN_IN_RE
 @Validated
 public class MemberSignInRecordServiceImpl implements MemberSignInRecordService {
 
+    /**
+     * 签到的分布式锁
+     *
+     * KEY 格式：member_sign_in:lock:{userId}
+     * VALUE 数据格式：HASH // RLock.class：Redisson 的 Lock 锁，使用 Hash 数据结构
+     */
+    private static final String SIGN_IN_LOCK = "member_sign_in:lock:%d";
+    private static final long SIGN_IN_LOCK_TIMEOUT_MILLIS = 30 * 1000L;
+
     @Resource
     private MemberSignInRecordMapper signInRecordMapper;
+
+    @Resource
+    private RedissonClient redissonClient;
     @Resource
     private MemberSignInConfigService signInConfigService;
     @Resource
@@ -107,8 +123,31 @@ public class MemberSignInRecordServiceImpl implements MemberSignInRecordService 
     }
 
     @Override
-    @Transactional(rollbackFor = Exception.class)
     public MemberSignInRecordDO createSignRecord(Long userId) {
+        // 【安全】串行化同一用户的并发签到。
+        //
+        // validateSigned() 只是一条普通 SELECT（读最新一条签到记录，判断是不是今天），
+        // 它和后面的 insert 签到记录 + 加积分之间没有行锁、CAS，member_sign_in_record 上
+        // 也没有「每人每天一条」的唯一索引，所以并发的 N 个请求会全部读到
+        // 「今天还没签」并全部发放奖励。积分的加法本身是原子的（point = point + ?），
+        // 但「加几次」没有被控制。
+        //
+        // 锁必须加在事务【外面】：如果在事务内加锁，就会在提交前 unlock，
+        // 后一个事务拿到锁后建立的一致性读快照仍可能看不到前一个事务刚插入的记录。
+        //
+        // 这里用 Redis 锁而不是 SELECT ... FOR UPDATE，因为 FOR UPDATE 在本项目支持的
+        // SQL Server 上是语法错误，而 Redisson 是所有部署都已经依赖的组件。
+        RLock lock = redissonClient.getLock(String.format(SIGN_IN_LOCK, userId));
+        lock.lock(SIGN_IN_LOCK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        try {
+            return getSelf().createSignRecord0(userId);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    @Transactional(rollbackFor = Exception.class)
+    public MemberSignInRecordDO createSignRecord0(Long userId) {
         // 1. 获取当前用户最近的签到
         MemberSignInRecordDO lastRecord = signInRecordMapper.selectLastRecordByUserId(userId);
         // 1.1. 判断是否重复签到
@@ -131,6 +170,15 @@ public class MemberSignInRecordServiceImpl implements MemberSignInRecordService 
             memberLevelService.addExperience(userId, record.getExperience(), MemberExperienceBizTypeEnum.SIGN_IN, String.valueOf(record.getId()));
         }
         return record;
+    }
+
+    /**
+     * 获得自身的代理对象，解决 AOP 生效问题
+     *
+     * @return 自己
+     */
+    private MemberSignInRecordServiceImpl getSelf() {
+        return SpringUtil.getBean(getClass());
     }
 
     private void validateSigned(MemberSignInRecordDO signInRecordDO) {
