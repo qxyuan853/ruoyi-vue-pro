@@ -89,15 +89,19 @@ public interface MemberUserMapper extends BaseMapperX<MemberUserDO> {
     /**
      * 更新用户积分（减少）
      *
+     * 仅当积分足够时才扣减（CAS），积分不足时返回 0 且不做任何修改，
+     * 避免并发扣减时多个请求读到同一余额、都通过校验后把积分扣成负数。
+     *
      * @param id        用户编号
      * @param incrCount 增加积分（负数）
-     * @return 更新行数
+     * @return 更新行数；0 表示积分不足
      */
     default int updatePointDecr(Long id, Integer incrCount) {
         Assert.isTrue(incrCount < 0);
         LambdaUpdateWrapper<MemberUserDO> lambdaUpdateWrapper = new LambdaUpdateWrapper<MemberUserDO>()
                 .setSql(" point = point + " + incrCount) // 负数，所以使用 + 号
-                .eq(MemberUserDO::getId, id);
+                .eq(MemberUserDO::getId, id)
+                .ge(MemberUserDO::getPoint, -incrCount); // cas 逻辑：积分足够才扣减
         return update(null, lambdaUpdateWrapper);
     }
 
