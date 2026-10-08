@@ -63,6 +63,8 @@ import cn.iocoder.yudao.module.trade.service.price.bo.TradePriceCalculateReqBO;
 import cn.iocoder.yudao.module.trade.service.price.bo.TradePriceCalculateRespBO;
 import cn.iocoder.yudao.module.trade.service.price.calculator.TradePriceCalculatorHelper;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -74,6 +76,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import static cn.iocoder.yudao.framework.common.exception.util.ServiceExceptionUtil.exception;
 import static cn.iocoder.yudao.framework.common.util.collection.CollectionUtils.*;
@@ -92,6 +95,18 @@ import static cn.iocoder.yudao.module.trade.enums.MessageTemplateConstants.WXA_O
 @Service
 @Slf4j
 public class TradeOrderUpdateServiceImpl implements TradeOrderUpdateService {
+
+    /**
+     * 活动订单（秒杀、拼团、积分商城）下单的分布式锁
+     *
+     * KEY 格式：trade_order_activity_create:lock:{活动类型}:{活动编号}:{用户编号}
+     * VALUE 数据格式：HASH // RLock.class：Redisson 的 Lock 锁，使用 Hash 数据结构
+     */
+    private static final String ACTIVITY_ORDER_CREATE_LOCK = "trade_order_activity_create:lock:%s:%d:%d";
+    private static final long ACTIVITY_ORDER_CREATE_LOCK_TIMEOUT_MILLIS = 30 * 1000L;
+
+    @Resource
+    private RedissonClient redissonClient;
 
     @Resource
     private TradeOrderMapper tradeOrderMapper;
@@ -181,9 +196,45 @@ public class TradeOrderUpdateServiceImpl implements TradeOrderUpdateService {
     }
 
     @Override
+    public TradeOrderDO createOrder(Long userId, AppTradeOrderCreateReqVO createReqVO) {
+        // 【安全】串行化同一 (活动, 用户) 的并发下单。
+        //
+        // 秒杀、拼团、积分商城的【每人限购】都是在价格计算时 SELECT 出该用户在活动下已购买的数量
+        // （TradeOrderQueryService#getActivityProductCount 等），再在同一个事务里 INSERT 订单，两步之间
+        // 没有行锁、CAS，trade_order 上也没有可用的唯一约束，所以并发请求会全部读到同一个已购数量、
+        // 全部通过 totalLimitCount（总限购数量）校验、全部下单成功。活动库存有条件更新兜底，但每人限购没有。
+        //
+        // 锁必须加在事务【外面】：如果在事务内加锁，提交前就 unlock，后一个事务在拿到锁之前已经建立的
+        // 一致性读快照仍看不到前一个事务刚插入的订单，锁就白加了。
+        String lockKey = buildActivityOrderCreateLockKey(userId, createReqVO);
+        if (lockKey == null) {
+            return getSelf().createOrder0(userId, createReqVO);
+        }
+        RLock lock = redissonClient.getLock(lockKey);
+        lock.lock(ACTIVITY_ORDER_CREATE_LOCK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        try {
+            return getSelf().createOrder0(userId, createReqVO);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private static String buildActivityOrderCreateLockKey(Long userId, AppTradeOrderCreateReqVO createReqVO) {
+        if (createReqVO.getSeckillActivityId() != null) {
+            return String.format(ACTIVITY_ORDER_CREATE_LOCK, "seckill", createReqVO.getSeckillActivityId(), userId);
+        }
+        if (createReqVO.getCombinationActivityId() != null) {
+            return String.format(ACTIVITY_ORDER_CREATE_LOCK, "combination", createReqVO.getCombinationActivityId(), userId);
+        }
+        if (createReqVO.getPointActivityId() != null) {
+            return String.format(ACTIVITY_ORDER_CREATE_LOCK, "point", createReqVO.getPointActivityId(), userId);
+        }
+        return null;
+    }
+
     @Transactional(rollbackFor = Exception.class)
     @TradeOrderLog(operateType = TradeOrderOperateTypeEnum.MEMBER_CREATE)
-    public TradeOrderDO createOrder(Long userId, AppTradeOrderCreateReqVO createReqVO) {
+    public TradeOrderDO createOrder0(Long userId, AppTradeOrderCreateReqVO createReqVO) {
         // 1.1 价格计算
         TradePriceCalculateRespBO calculateRespBO = calculatePrice(userId, createReqVO);
         // 1.2 构建订单
