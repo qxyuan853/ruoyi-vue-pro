@@ -8,6 +8,8 @@ import cn.iocoder.yudao.module.promotion.controller.admin.bargain.vo.activity.Ba
 import cn.iocoder.yudao.module.promotion.dal.dataobject.bargain.BargainActivityDO;
 import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import org.apache.ibatis.annotations.Mapper;
+import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -19,6 +21,9 @@ import java.util.List;
  */
 @Mapper
 public interface BargainActivityMapper extends BaseMapperX<BargainActivityDO> {
+
+    @Select("SELECT * FROM promotion_bargain_activity WHERE id = #{id} FOR UPDATE")
+    BargainActivityDO selectByIdForUpdate(@Param("id") Long id);
 
     default PageResult<BargainActivityDO> selectPage(BargainActivityPageReqVO reqVO) {
         return selectPage(reqVO, new LambdaQueryWrapperX<BargainActivityDO>()

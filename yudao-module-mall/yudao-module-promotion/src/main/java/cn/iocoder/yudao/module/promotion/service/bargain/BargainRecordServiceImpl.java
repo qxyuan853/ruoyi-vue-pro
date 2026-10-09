@@ -10,6 +10,7 @@ import cn.iocoder.yudao.module.promotion.controller.admin.bargain.vo.recrod.Barg
 import cn.iocoder.yudao.module.promotion.controller.app.bargain.vo.record.AppBargainRecordCreateReqVO;
 import cn.iocoder.yudao.module.promotion.dal.dataobject.bargain.BargainActivityDO;
 import cn.iocoder.yudao.module.promotion.dal.dataobject.bargain.BargainRecordDO;
+import cn.iocoder.yudao.module.promotion.dal.mysql.bargain.BargainActivityMapper;
 import cn.iocoder.yudao.module.promotion.dal.mysql.bargain.BargainRecordMapper;
 import cn.iocoder.yudao.module.promotion.enums.bargain.BargainRecordStatusEnum;
 import org.springframework.stereotype.Service;
@@ -39,10 +40,18 @@ public class BargainRecordServiceImpl implements BargainRecordService {
     private BargainActivityService bargainActivityService;
 
     @Resource
+    private BargainActivityMapper bargainActivityMapper;
+
+    @Resource
     private BargainRecordMapper bargainRecordMapper;
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
     public Long createBargainRecord(Long userId, AppBargainRecordCreateReqVO reqVO) {
+        // Serialize attempts against the activity row before reading the user's records.
+        // The transaction keeps this lock through both limit checks and the insert.
+        bargainActivityMapper.selectByIdForUpdate(reqVO.getActivityId());
+
         // 1. 校验砍价活动（包括库存）
         BargainActivityDO activity = bargainActivityService.validateBargainActivityCanJoin(reqVO.getActivityId());
 
